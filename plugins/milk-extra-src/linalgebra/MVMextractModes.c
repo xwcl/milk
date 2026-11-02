@@ -88,6 +88,9 @@ long fpi_twait;
 static int64_t *GPUtiming;
 long fpi_GPUtiming;
 
+static int64_t *GPUpinned;
+long fpi_GPUpinned;
+
 
 
 static CLICMDARGDEF farg[] =
@@ -244,6 +247,15 @@ static CLICMDARGDEF farg[] =
         CLIARG_HIDDEN_DEFAULT,
         (void **) &GPUtiming,
         &fpi_GPUtiming
+    },
+    {
+        CLIARG_ONOFF,
+        ".option.GPUpinned",
+        "stage GPU transfers through pinned host buffers",
+        "0",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &GPUpinned,
+        &fpi_GPUpinned
     }
 };
 
@@ -259,6 +271,7 @@ static errno_t customCONFsetup()
         data.fpsptr->parray[fpi_immodes].fpflag |=
             FPFLAG_STREAM_RUN_REQUIRED | FPFLAG_CHECKSTREAM;
         data.fpsptr->parray[fpi_GPUtiming].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_GPUpinned].fpflag |= FPFLAG_WRITERUN;
     }
 
     return RETURN_SUCCESS;
@@ -319,6 +332,8 @@ static errno_t compute_function()
     float *d_modes = NULL; // linear memory of GPU
     float *d_in = NULL;
     float *d_modeval = NULL;
+    float *h_in = NULL;      // pinned host staging for d_in, used with .option.GPUpinned
+    float *h_modeval = NULL; // pinned host staging for d_modeval, used with .option.GPUpinned
 
 
 
@@ -746,6 +761,14 @@ static errno_t compute_function()
 
             cudaEventCreate(&evgemv0);
             cudaEventCreate(&evgemv1);
+
+            // pinned buffers let the DMA engine copy directly, skipping the driver's staging copy
+            if(cudaMallocHost((void **)&h_in, sizeof(float) * mask_npix) != cudaSuccess ||
+                    cudaMallocHost((void **)&h_modeval, sizeof(float) * NBmodes) != cudaSuccess)
+            {
+                printf("cudaMallocHost returned error, line %d\n", __LINE__);
+                exit(EXIT_FAILURE);
+            }
 #else
             processinfo_WriteMessage(processinfo, "NO CUDA - CPU fallback");
             *GPUindex = 99;
@@ -1197,24 +1220,30 @@ static errno_t compute_function()
             struct timespec t0, t1, t2, t3, t4;
             clock_gettime(CLOCK_MILK, &t0);
             int gputiming = (*GPUtiming == 1); // read once so both events are recorded
+            int gpupinned = (*GPUpinned == 1);
 
             // load in_stream to GPU (the reference when one is being computed)
             float *srcpix = (initref == 0) ? data.image[IDinref].array.F : imginfloatptr;
+            float *hin = gpupinned ? h_in : masked_pix;
             if(use_mask == 1)
             {
                 for(uint32_t cc = 0; cc < mask_npix; ++cc)
                 {
-                    masked_pix[cc] = srcpix[mask_idx[cc]];
+                    hin[cc] = srcpix[mask_idx[cc]];
                 }
+            }
+            else if(gpupinned)
+            {
+                memcpy(hin, srcpix, sizeof(float) * mask_npix);
             }
             else
             {
-                masked_pix = srcpix;
+                hin = srcpix;
             }
             clock_gettime(CLOCK_MILK, &t1);
 
             cudaStat = cudaMemcpy(d_in,
-                                  masked_pix,
+                                  hin,
                                   sizeof(float) * mask_npix,
                                   cudaMemcpyHostToDevice);
             clock_gettime(CLOCK_MILK, &t2);
@@ -1305,7 +1334,8 @@ static errno_t compute_function()
             }
             else
             {
-                cudaStat = cudaMemcpy(modevalarray,
+                float *hmodeval = gpupinned ? h_modeval : modevalarray;
+                cudaStat = cudaMemcpy(hmodeval,
                                       d_modeval,
                                       sizeof(float) * NBmodes,
                                       cudaMemcpyDeviceToHost);
@@ -1314,7 +1344,7 @@ static errno_t compute_function()
                 for(long k = 0; k < NBmodes; k++)
                 {
                     imgout.im->array.F[k] =
-                        (modevalarray[k] - modevalarrayref[k]) / normcoeff[k];
+                        (hmodeval[k] - modevalarrayref[k]) / normcoeff[k];
                     // Renorm was never implemented
                     // (modevalarray[k] / data.image[IDintot].array.F[0] - modevalarrayref[k]) / normcoeff[k];
                 }
@@ -1358,6 +1388,14 @@ static errno_t compute_function()
     free(normcoeff);
     free(modevalarray);
     free(modevalarrayref);
+
+#ifdef HAVE_CUDA
+    if(h_in != NULL)
+    {
+        cudaFreeHost(h_in);
+        cudaFreeHost(h_modeval);
+    }
+#endif
 
 
     if(imgin.md->datatype != _DATATYPE_FLOAT)
