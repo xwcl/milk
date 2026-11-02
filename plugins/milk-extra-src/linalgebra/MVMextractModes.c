@@ -85,6 +85,9 @@ long fpi_outrefsname;
 static uint64_t *twait;
 long fpi_twait;
 
+static int64_t *GPUtiming;
+long fpi_GPUtiming;
+
 
 
 static CLICMDARGDEF farg[] =
@@ -232,6 +235,15 @@ static CLICMDARGDEF farg[] =
         CLIARG_HIDDEN_DEFAULT,
         (void **) &nmax,
         &fpi_nmax
+    },
+    {
+        CLIARG_ONOFF,
+        ".option.GPUtiming",
+        "time the GPU MVM kernel with CUDA events",
+        "0",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &GPUtiming,
+        &fpi_GPUtiming
     }
 };
 
@@ -246,6 +258,7 @@ static errno_t customCONFsetup()
             FPFLAG_STREAM_RUN_REQUIRED | FPFLAG_CHECKSTREAM;
         data.fpsptr->parray[fpi_immodes].fpflag |=
             FPFLAG_STREAM_RUN_REQUIRED | FPFLAG_CHECKSTREAM;
+        data.fpsptr->parray[fpi_GPUtiming].fpflag |= FPFLAG_WRITERUN;
     }
 
     return RETURN_SUCCESS;
@@ -300,6 +313,7 @@ static errno_t compute_function()
     cublasStatus_t cublas_status = CUBLAS_STATUS_SUCCESS;
     cudaError_t cudaStat = cudaSuccess;
     struct cudaDeviceProp deviceProp;
+    cudaEvent_t evgemv0, evgemv1; // bracket the GPU MVM kernel for .option.GPUtiming
 #endif
 
     float *d_modes = NULL; // linear memory of GPU
@@ -729,6 +743,9 @@ static errno_t compute_function()
                        __LINE__);
                 exit(EXIT_FAILURE);
             }
+
+            cudaEventCreate(&evgemv0);
+            cudaEventCreate(&evgemv1);
 #else
             processinfo_WriteMessage(processinfo, "NO CUDA - CPU fallback");
             *GPUindex = 99;
@@ -1176,46 +1193,31 @@ static errno_t compute_function()
             // running on GPU
 #ifdef HAVE_CUDA
 
-            struct timespec t0, t1;
+            // stage times: t0 start, t1 gathered, t2 on GPU, t3 result back, t4 output written
+            struct timespec t0, t1, t2, t3, t4;
             clock_gettime(CLOCK_MILK, &t0);
+            int gputiming = (*GPUtiming == 1); // read once so both events are recorded
 
-            // load in_stream to GPU
-            if(initref == 0)
+            // load in_stream to GPU (the reference when one is being computed)
+            float *srcpix = (initref == 0) ? data.image[IDinref].array.F : imginfloatptr;
+            if(use_mask == 1)
             {
-                if(use_mask == 1)
+                for(uint32_t cc = 0; cc < mask_npix; ++cc)
                 {
-                    for(uint32_t cc = 0; cc < mask_npix; ++cc)
-                    {
-                        masked_pix[cc] = data.image[IDinref].array.F[mask_idx[cc]];
-                    }
+                    masked_pix[cc] = srcpix[mask_idx[cc]];
                 }
-                else
-                {
-                    masked_pix = data.image[IDinref].array.F;
-                }
-                cudaStat = cudaMemcpy(d_in,
-                                      masked_pix,
-                                      sizeof(float) * mask_npix,
-                                      cudaMemcpyHostToDevice);
             }
             else
             {
-                if(use_mask == 1)
-                {
-                    for(uint32_t cc = 0; cc < mask_npix; ++cc)
-                    {
-                        masked_pix[cc] = imginfloatptr[mask_idx[cc]];
-                    }
-                }
-                else
-                {
-                    masked_pix = imginfloatptr;
-                }
-                cudaStat = cudaMemcpy(d_in,
-                                      masked_pix,
-                                      sizeof(float) * mask_npix,
-                                      cudaMemcpyHostToDevice);
+                masked_pix = srcpix;
             }
+            clock_gettime(CLOCK_MILK, &t1);
+
+            cudaStat = cudaMemcpy(d_in,
+                                  masked_pix,
+                                  sizeof(float) * mask_npix,
+                                  cudaMemcpyHostToDevice);
+            clock_gettime(CLOCK_MILK, &t2);
 
             if(cudaStat != cudaSuccess)
             {
@@ -1227,6 +1229,10 @@ static errno_t compute_function()
             }
 
             // compute
+            if(gputiming)
+            {
+                cudaEventRecord(evgemv0, 0);
+            }
             cublas_status = cublasSgemv(cublasH,
                                         CUBLAS_OP_T,
                                         mask_npix,
@@ -1272,6 +1278,10 @@ static errno_t compute_function()
                 fflush(stdout);
                 exit(EXIT_FAILURE);
             }
+            if(gputiming)
+            {
+                cudaEventRecord(evgemv1, 0);
+            }
 
             // copy result
             imgout.md->write = 1;
@@ -1299,7 +1309,7 @@ static errno_t compute_function()
                                       d_modeval,
                                       sizeof(float) * NBmodes,
                                       cudaMemcpyDeviceToHost);
-
+                clock_gettime(CLOCK_MILK, &t3);
 
                 for(long k = 0; k < NBmodes; k++)
                 {
@@ -1312,12 +1322,22 @@ static errno_t compute_function()
 
 
 
-                clock_gettime(CLOCK_MILK, &t1);
-                struct timespec tdiff;
-                tdiff = timespec_diff(t0, t1);
-                double t01d  = 1.0 * tdiff.tv_sec + 1.0e-9 * tdiff.tv_nsec;
-                processinfo_WriteMessage_fmt(processinfo, "GPU%d %dx%d MVM %.3f us", *GPUindex,
-                                             n, m, t01d * 1e6);
+                clock_gettime(CLOCK_MILK, &t4);
+
+                // gemv+D2H includes waiting for the kernel; kernel is its GPU-side time
+                float kernelms = 0;
+                if(gputiming)
+                {
+                    cudaEventElapsedTime(&kernelms, evgemv0, evgemv1);
+                }
+                processinfo_WriteMessage_fmt(processinfo,
+                                             "GPU%d %dx%d MVM %.3f us (gather %.1f H2D %.1f gemv+D2H %.1f out %.1f kernel %.1f)",
+                                             *GPUindex, n, m, timespec_diff_double(t0, t4) * 1e6,
+                                             timespec_diff_double(t0, t1) * 1e6,
+                                             timespec_diff_double(t1, t2) * 1e6,
+                                             timespec_diff_double(t2, t3) * 1e6,
+                                             timespec_diff_double(t3, t4) * 1e6,
+                                             kernelms * 1e3);
 
 
 
