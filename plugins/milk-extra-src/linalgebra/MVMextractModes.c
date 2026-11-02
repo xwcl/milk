@@ -1354,20 +1354,25 @@ static errno_t compute_function()
 
                 clock_gettime(CLOCK_MILK, &t4);
 
-                // gemv+D2H includes waiting for the kernel; kernel is its GPU-side time
-                float kernelms = 0;
                 if(gputiming)
                 {
+                    // compact to fit procCTRL's 35-char message column, all in us:
+                    // total, gather, H2D, wait for gemv + D2H, output, GPU-side kernel time
+                    float kernelms = 0;
                     cudaEventElapsedTime(&kernelms, evgemv0, evgemv1);
+                    processinfo_WriteMessage_fmt(processinfo, "G%d %.1f:g%.1f h%.1f w%.1f o%.1f k%.1f",
+                                                 *GPUindex, timespec_diff_double(t0, t4) * 1e6,
+                                                 timespec_diff_double(t0, t1) * 1e6,
+                                                 timespec_diff_double(t1, t2) * 1e6,
+                                                 timespec_diff_double(t2, t3) * 1e6,
+                                                 timespec_diff_double(t3, t4) * 1e6,
+                                                 kernelms * 1e3);
                 }
-                processinfo_WriteMessage_fmt(processinfo,
-                                             "GPU%d %dx%d MVM %.3f us (gather %.1f H2D %.1f gemv+D2H %.1f out %.1f kernel %.1f)",
-                                             *GPUindex, n, m, timespec_diff_double(t0, t4) * 1e6,
-                                             timespec_diff_double(t0, t1) * 1e6,
-                                             timespec_diff_double(t1, t2) * 1e6,
-                                             timespec_diff_double(t2, t3) * 1e6,
-                                             timespec_diff_double(t3, t4) * 1e6,
-                                             kernelms * 1e3);
+                else
+                {
+                    processinfo_WriteMessage_fmt(processinfo, "GPU%d %dx%d MVM %.3f us", *GPUindex,
+                                                 n, m, timespec_diff_double(t0, t4) * 1e6);
+                }
 
 
 
