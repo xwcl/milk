@@ -94,6 +94,9 @@ long fpi_GPUpinned;
 static int64_t *GPUgraph;
 long fpi_GPUgraph;
 
+static int32_t *GPUsplit;
+long fpi_GPUsplit;
+
 
 
 static CLICMDARGDEF farg[] =
@@ -268,6 +271,15 @@ static CLICMDARGDEF farg[] =
         CLIARG_HIDDEN_DEFAULT,
         (void **) &GPUgraph,
         &fpi_GPUgraph
+    },
+    {
+        CLIARG_INT32,
+        ".option.GPUsplit",
+        "second GPU computing half the modes, -1 for none (uses the CUDA graph)",
+        "-1",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &GPUsplit,
+        &fpi_GPUsplit
     }
 };
 
@@ -285,6 +297,7 @@ static errno_t customCONFsetup()
         data.fpsptr->parray[fpi_GPUtiming].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUpinned].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUgraph].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_GPUsplit].fpflag |= FPFLAG_WRITERUN;
     }
 
     return RETURN_SUCCESS;
@@ -356,6 +369,79 @@ static cudaGraphExec_t capture_mvm_graph(
 
     return graphexec;
 }
+
+
+
+// Second-GPU state for .option.GPUsplit
+typedef struct
+{
+    int             dev;      // second GPU index, -1 until set up
+    int             n0;       // modes [0, n0) run on the first GPU, the rest on the second
+    cudaGraphExec_t graph0;   // first GPU's graph over modes [0, n0)
+    cudaGraphExec_t graph1;   // second GPU's graph over modes [n0, NBmodes)
+    cudaStream_t    stream1;
+    cublasHandle_t  cublasH1;
+    float          *d_modes1;
+    float          *d_in1;
+    float          *d_modeval1;
+} MVMSPLIT;
+
+// Copy the second half of the modes to dev1 and capture a graph on each GPU.
+// The modes are matrix columns, so each half is contiguous in d_modes.
+// Both graphs read h_in and write their half of h_modeval.
+// Returns 0 on success, -1 on failure.
+static int setup_mvm_split(
+    MVMSPLIT *sp,
+    int dev0,
+    int dev1,
+    cudaStream_t stream0,
+    cublasHandle_t cublasH0,
+    float *d_in0,
+    float *d_modeval0,
+    const float *d_modes,
+    const float *h_in,
+    int npix,
+    int NBmodes,
+    float alpha,
+    float beta,
+    float *h_modeval
+)
+{
+    sp->n0 = NBmodes / 2;
+    int n1 = NBmodes - sp->n0;
+
+    sp->graph0 = capture_mvm_graph(stream0, cublasH0, d_in0, h_in, npix, d_modes, sp->n0,
+                                   alpha, beta, d_modeval0, h_modeval);
+    if(sp->graph0 == NULL)
+    {
+        return -1;
+    }
+
+    // first use of dev1 creates its context, which takes a while
+    int ok = (cudaSetDevice(dev1) == cudaSuccess)
+             && (cudaMalloc((void **)&sp->d_modes1, sizeof(float) * npix * n1) == cudaSuccess)
+             && (cudaMalloc((void **)&sp->d_in1, sizeof(float) * npix) == cudaSuccess)
+             && (cudaMalloc((void **)&sp->d_modeval1, sizeof(float) * n1) == cudaSuccess)
+             && (cudaMemcpyPeer(sp->d_modes1, dev1, d_modes + (size_t) npix * sp->n0, dev0,
+                                sizeof(float) * npix * n1) == cudaSuccess)
+             && (cudaStreamCreateWithFlags(&sp->stream1, cudaStreamNonBlocking) == cudaSuccess)
+             && (cublasCreate(&sp->cublasH1) == CUBLAS_STATUS_SUCCESS);
+    if(ok)
+    {
+        sp->graph1 = capture_mvm_graph(sp->stream1, sp->cublasH1, sp->d_in1, h_in, npix,
+                                       sp->d_modes1, n1, alpha, beta, sp->d_modeval1,
+                                       h_modeval + sp->n0);
+        ok = (sp->graph1 != NULL);
+    }
+    cudaSetDevice(dev0);
+
+    if(!ok)
+    {
+        return -1;
+    }
+    sp->dev = dev1;
+    return 0;
+}
 #endif
 
 
@@ -386,6 +472,7 @@ static errno_t compute_function()
     cudaEvent_t evgemv0, evgemv1; // bracket the GPU MVM kernel for .option.GPUtiming
     cudaStream_t mvmstream = NULL;    // stream for .option.GPUgraph
     cudaGraphExec_t mvmgraph = NULL;  // captured on first use of .option.GPUgraph
+    MVMSPLIT mvmsplit = {.dev = -1};  // set up on first use of .option.GPUsplit
 #endif
 
     float *d_modes = NULL; // linear memory of GPU
@@ -1281,8 +1368,20 @@ static errno_t compute_function()
             clock_gettime(CLOCK_MILK, &t0);
             int gputiming = (*GPUtiming == 1); // read once so both events are recorded
             // the reference frame always takes the step-by-step path
-            int gpugraph = (*GPUgraph == 1) && (initref == 1);
-            if(gpugraph && mvmgraph == NULL)
+            int gpusplit = (*GPUsplit >= 0) && (*GPUsplit != *GPUindex) && (initref == 1);
+            if(gpusplit && mvmsplit.dev < 0)
+            {
+                if(setup_mvm_split(&mvmsplit, *GPUindex, *GPUsplit, mvmstream, cublasH, d_in,
+                                   d_modeval, d_modes, h_in, mask_npix, NBmodes, alpha, beta,
+                                   h_modeval) != 0)
+                {
+                    processinfo_WriteMessage(processinfo, "GPU split setup failed");
+                    *GPUsplit = -1;
+                    gpusplit = 0;
+                }
+            }
+            int gpugraph = ((*GPUgraph == 1) && (initref == 1)) || gpusplit;
+            if(gpugraph && !gpusplit && mvmgraph == NULL)
             {
                 mvmgraph = capture_mvm_graph(mvmstream, cublasH, d_in, h_in, mask_npix, d_modes,
                                              NBmodes, alpha, beta, d_modeval, h_modeval);
@@ -1319,14 +1418,21 @@ static errno_t compute_function()
             if(gpugraph)
             {
                 // with the graph, kernel timing covers both copies and the MVM
+                // (on the first GPU only when split)
                 if(gputiming)
                 {
                     cudaEventRecord(evgemv0, mvmstream);
                 }
-                cudaStat = cudaGraphLaunch(mvmgraph, mvmstream);
+                cudaStat = cudaGraphLaunch(gpusplit ? mvmsplit.graph0 : mvmgraph, mvmstream);
                 if(gputiming)
                 {
                     cudaEventRecord(evgemv1, mvmstream);
+                }
+                if(gpusplit && cudaStat == cudaSuccess)
+                {
+                    cudaSetDevice(mvmsplit.dev);
+                    cudaStat = cudaGraphLaunch(mvmsplit.graph1, mvmsplit.stream1);
+                    cudaSetDevice(*GPUindex);
                 }
             }
             else
@@ -1431,6 +1537,10 @@ static errno_t compute_function()
                 if(gpugraph)
                 {
                     cudaStat = cudaStreamSynchronize(mvmstream);
+                    if(gpusplit && cudaStat == cudaSuccess)
+                    {
+                        cudaStat = cudaStreamSynchronize(mvmsplit.stream1);
+                    }
                 }
                 else
                 {
@@ -1507,6 +1617,17 @@ static errno_t compute_function()
     if(mvmstream != NULL)
     {
         cudaStreamDestroy(mvmstream);
+    }
+    if(mvmsplit.dev >= 0)
+    {
+        cudaGraphExecDestroy(mvmsplit.graph0);
+        cudaSetDevice(mvmsplit.dev);
+        cudaGraphExecDestroy(mvmsplit.graph1);
+        cudaStreamDestroy(mvmsplit.stream1);
+        cublasDestroy(mvmsplit.cublasH1);
+        cudaFree(mvmsplit.d_modes1);
+        cudaFree(mvmsplit.d_in1);
+        cudaFree(mvmsplit.d_modeval1);
     }
 #endif
 
