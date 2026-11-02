@@ -91,6 +91,9 @@ long fpi_GPUtiming;
 static int64_t *GPUpinned;
 long fpi_GPUpinned;
 
+static int64_t *GPUgraph;
+long fpi_GPUgraph;
+
 
 
 static CLICMDARGDEF farg[] =
@@ -256,6 +259,15 @@ static CLICMDARGDEF farg[] =
         CLIARG_HIDDEN_DEFAULT,
         (void **) &GPUpinned,
         &fpi_GPUpinned
+    },
+    {
+        CLIARG_ONOFF,
+        ".option.GPUgraph",
+        "launch the per-frame GPU copies and MVM as one CUDA graph",
+        "0",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &GPUgraph,
+        &fpi_GPUgraph
     }
 };
 
@@ -272,6 +284,7 @@ static errno_t customCONFsetup()
             FPFLAG_STREAM_RUN_REQUIRED | FPFLAG_CHECKSTREAM;
         data.fpsptr->parray[fpi_GPUtiming].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUpinned].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_GPUgraph].fpflag |= FPFLAG_WRITERUN;
     }
 
     return RETURN_SUCCESS;
@@ -303,6 +316,50 @@ static errno_t help_function()
 
 
 
+#ifdef HAVE_CUDA
+// Capture the per-frame GPU work (input copy, MVM, result copy) as one CUDA graph,
+// replacing three launches and their synchronizations with one of each.
+// Returns NULL if capture fails.
+static cudaGraphExec_t capture_mvm_graph(
+    cudaStream_t stream,
+    cublasHandle_t cublasH,
+    float *d_in,
+    const float *h_in,
+    int npix,
+    const float *d_modes,
+    int NBmodes,
+    float alpha,
+    float beta,
+    float *d_modeval,
+    float *h_modeval
+)
+{
+    cudaGraph_t graph;
+    cudaGraphExec_t graphexec = NULL;
+
+    cublasSetStream(cublasH, stream);
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
+    cudaMemcpyAsync(d_in, h_in, sizeof(float) * npix, cudaMemcpyHostToDevice, stream);
+    cublasSgemv(cublasH, CUBLAS_OP_T, npix, NBmodes, &alpha, d_modes, npix, d_in, 1,
+                &beta, d_modeval, 1);
+    cudaMemcpyAsync(h_modeval, d_modeval, sizeof(float) * NBmodes, cudaMemcpyDeviceToHost,
+                    stream);
+    if(cudaStreamEndCapture(stream, &graph) == cudaSuccess)
+    {
+        if(cudaGraphInstantiateWithFlags(&graphexec, graph, 0) != cudaSuccess)
+        {
+            graphexec = NULL;
+        }
+        cudaGraphDestroy(graph);
+    }
+    cublasSetStream(cublasH, 0);
+
+    return graphexec;
+}
+#endif
+
+
+
 
 
 
@@ -327,6 +384,8 @@ static errno_t compute_function()
     cudaError_t cudaStat = cudaSuccess;
     struct cudaDeviceProp deviceProp;
     cudaEvent_t evgemv0, evgemv1; // bracket the GPU MVM kernel for .option.GPUtiming
+    cudaStream_t mvmstream = NULL;    // stream for .option.GPUgraph
+    cudaGraphExec_t mvmgraph = NULL;  // captured on first use of .option.GPUgraph
 #endif
 
     float *d_modes = NULL; // linear memory of GPU
@@ -761,6 +820,7 @@ static errno_t compute_function()
 
             cudaEventCreate(&evgemv0);
             cudaEventCreate(&evgemv1);
+            cudaStreamCreateWithFlags(&mvmstream, cudaStreamNonBlocking);
 
             // pinned buffers let the DMA engine copy directly, skipping the driver's staging copy
             if(cudaMallocHost((void **)&h_in, sizeof(float) * mask_npix) != cudaSuccess ||
@@ -1220,7 +1280,21 @@ static errno_t compute_function()
             struct timespec t0, t1, t2, t3, t4;
             clock_gettime(CLOCK_MILK, &t0);
             int gputiming = (*GPUtiming == 1); // read once so both events are recorded
-            int gpupinned = (*GPUpinned == 1);
+            // the reference frame always takes the step-by-step path
+            int gpugraph = (*GPUgraph == 1) && (initref == 1);
+            if(gpugraph && mvmgraph == NULL)
+            {
+                mvmgraph = capture_mvm_graph(mvmstream, cublasH, d_in, h_in, mask_npix, d_modes,
+                                             NBmodes, alpha, beta, d_modeval, h_modeval);
+                if(mvmgraph == NULL)
+                {
+                    processinfo_WriteMessage(processinfo, "GPU graph capture failed");
+                    data.fpsptr->parray[fpi_GPUgraph].fpflag &= ~FPFLAG_ONOFF;
+                    *GPUgraph = 0;
+                    gpugraph = 0;
+                }
+            }
+            int gpupinned = (*GPUpinned == 1) || gpugraph; // the graph copies through the pinned buffers
 
             // load in_stream to GPU (the reference when one is being computed)
             float *srcpix = (initref == 0) ? data.image[IDinref].array.F : imginfloatptr;
@@ -1242,10 +1316,26 @@ static errno_t compute_function()
             }
             clock_gettime(CLOCK_MILK, &t1);
 
-            cudaStat = cudaMemcpy(d_in,
-                                  hin,
-                                  sizeof(float) * mask_npix,
-                                  cudaMemcpyHostToDevice);
+            if(gpugraph)
+            {
+                // with the graph, kernel timing covers both copies and the MVM
+                if(gputiming)
+                {
+                    cudaEventRecord(evgemv0, mvmstream);
+                }
+                cudaStat = cudaGraphLaunch(mvmgraph, mvmstream);
+                if(gputiming)
+                {
+                    cudaEventRecord(evgemv1, mvmstream);
+                }
+            }
+            else
+            {
+                cudaStat = cudaMemcpy(d_in,
+                                      hin,
+                                      sizeof(float) * mask_npix,
+                                      cudaMemcpyHostToDevice);
+            }
             clock_gettime(CLOCK_MILK, &t2);
 
             if(cudaStat != cudaSuccess)
@@ -1258,22 +1348,25 @@ static errno_t compute_function()
             }
 
             // compute
-            if(gputiming)
+            if(gputiming && !gpugraph)
             {
                 cudaEventRecord(evgemv0, 0);
             }
-            cublas_status = cublasSgemv(cublasH,
-                                        CUBLAS_OP_T,
-                                        mask_npix,
-                                        NBmodes,
-                                        &alpha,
-                                        d_modes,
-                                        mask_npix,
-                                        d_in,
-                                        1,
-                                        &beta,
-                                        d_modeval,
-                                        1);
+            if(!gpugraph)
+            {
+                cublas_status = cublasSgemv(cublasH,
+                                            CUBLAS_OP_T,
+                                            mask_npix,
+                                            NBmodes,
+                                            &alpha,
+                                            d_modes,
+                                            mask_npix,
+                                            d_in,
+                                            1,
+                                            &beta,
+                                            d_modeval,
+                                            1);
+            }
             if(cublas_status != CUBLAS_STATUS_SUCCESS)
             {
                 printf("cublasSgemv returned error code %d, line(%d)\n",
@@ -1307,7 +1400,7 @@ static errno_t compute_function()
                 fflush(stdout);
                 exit(EXIT_FAILURE);
             }
-            if(gputiming)
+            if(gputiming && !gpugraph)
             {
                 cudaEventRecord(evgemv1, 0);
             }
@@ -1335,10 +1428,17 @@ static errno_t compute_function()
             else
             {
                 float *hmodeval = gpupinned ? h_modeval : modevalarray;
-                cudaStat = cudaMemcpy(hmodeval,
-                                      d_modeval,
-                                      sizeof(float) * NBmodes,
-                                      cudaMemcpyDeviceToHost);
+                if(gpugraph)
+                {
+                    cudaStat = cudaStreamSynchronize(mvmstream);
+                }
+                else
+                {
+                    cudaStat = cudaMemcpy(hmodeval,
+                                          d_modeval,
+                                          sizeof(float) * NBmodes,
+                                          cudaMemcpyDeviceToHost);
+                }
                 clock_gettime(CLOCK_MILK, &t3);
 
                 for(long k = 0; k < NBmodes; k++)
@@ -1399,6 +1499,14 @@ static errno_t compute_function()
     {
         cudaFreeHost(h_in);
         cudaFreeHost(h_modeval);
+    }
+    if(mvmgraph != NULL)
+    {
+        cudaGraphExecDestroy(mvmgraph);
+    }
+    if(mvmstream != NULL)
+    {
+        cudaStreamDestroy(mvmstream);
     }
 #endif
 
