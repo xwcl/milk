@@ -31,6 +31,10 @@
 
 #include "MVM_CPU.h"
 
+#ifdef HAVE_CUDA
+#include "MVM_fp16.h"
+#endif
+
 
 
 // Local variables pointers
@@ -96,6 +100,9 @@ long fpi_GPUgraph;
 
 static int32_t *GPUsplit;
 long fpi_GPUsplit;
+
+static int64_t *GPUfp16;
+long fpi_GPUfp16;
 
 
 
@@ -280,6 +287,15 @@ static CLICMDARGDEF farg[] =
         CLIARG_HIDDEN_DEFAULT,
         (void **) &GPUsplit,
         &fpi_GPUsplit
+    },
+    {
+        CLIARG_ONOFF,
+        ".option.GPUfp16",
+        "GPU MVM with a half-precision matrix, single-precision sums (not with GPUsplit)",
+        "0",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &GPUfp16,
+        &fpi_GPUfp16
     }
 };
 
@@ -298,6 +314,7 @@ static errno_t customCONFsetup()
         data.fpsptr->parray[fpi_GPUpinned].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUgraph].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUsplit].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_GPUfp16].fpflag |= FPFLAG_WRITERUN;
     }
 
     return RETURN_SUCCESS;
@@ -332,6 +349,7 @@ static errno_t help_function()
 #ifdef HAVE_CUDA
 // Capture the per-frame GPU work (input copy, MVM, result copy) as one CUDA graph,
 // replacing three launches and their synchronizations with one of each.
+// The MVM uses the fp16 matrix d_modesh when given, otherwise cuBLAS on d_modes.
 // Returns NULL if capture fails.
 static cudaGraphExec_t capture_mvm_graph(
     cudaStream_t stream,
@@ -344,7 +362,10 @@ static cudaGraphExec_t capture_mvm_graph(
     float alpha,
     float beta,
     float *d_modeval,
-    float *h_modeval
+    float *h_modeval,
+    const void *d_modesh,
+    const float *d_mscale,
+    int ldah
 )
 {
     cudaGraph_t graph;
@@ -353,8 +374,15 @@ static cudaGraphExec_t capture_mvm_graph(
     cublasSetStream(cublasH, stream);
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
     cudaMemcpyAsync(d_in, h_in, sizeof(float) * npix, cudaMemcpyHostToDevice, stream);
-    cublasSgemv(cublasH, CUBLAS_OP_T, npix, NBmodes, &alpha, d_modes, npix, d_in, 1,
-                &beta, d_modeval, 1);
+    if(d_modesh != NULL)
+    {
+        MVM_fp16_gemvT(d_modesh, d_mscale, d_in, d_modeval, ldah, NBmodes, stream);
+    }
+    else
+    {
+        cublasSgemv(cublasH, CUBLAS_OP_T, npix, NBmodes, &alpha, d_modes, npix, d_in, 1,
+                    &beta, d_modeval, 1);
+    }
     cudaMemcpyAsync(h_modeval, d_modeval, sizeof(float) * NBmodes, cudaMemcpyDeviceToHost,
                     stream);
     if(cudaStreamEndCapture(stream, &graph) == cudaSuccess)
@@ -411,7 +439,7 @@ static int setup_mvm_split(
     int n1 = NBmodes - sp->n0;
 
     sp->graph0 = capture_mvm_graph(stream0, cublasH0, d_in0, h_in, npix, d_modes, sp->n0,
-                                   alpha, beta, d_modeval0, h_modeval);
+                                   alpha, beta, d_modeval0, h_modeval, NULL, NULL, 0);
     if(sp->graph0 == NULL)
     {
         return -1;
@@ -430,7 +458,7 @@ static int setup_mvm_split(
     {
         sp->graph1 = capture_mvm_graph(sp->stream1, sp->cublasH1, sp->d_in1, h_in, npix,
                                        sp->d_modes1, n1, alpha, beta, sp->d_modeval1,
-                                       h_modeval + sp->n0);
+                                       h_modeval + sp->n0, NULL, NULL, 0);
         ok = (sp->graph1 != NULL);
     }
     cudaSetDevice(dev0);
@@ -473,6 +501,10 @@ static errno_t compute_function()
     cudaStream_t mvmstream = NULL;    // stream for .option.GPUgraph
     cudaGraphExec_t mvmgraph = NULL;  // captured on first use of .option.GPUgraph
     MVMSPLIT mvmsplit = {.dev = -1};  // set up on first use of .option.GPUsplit
+    void *d_modesh = NULL;            // fp16 matrix, converted on first use of .option.GPUfp16
+    float *d_mscale = NULL;           // per-mode scale of d_modesh
+    int ldah = 0;                     // padded column length of d_modesh
+    cudaGraphExec_t mvmgraph16 = NULL; // .option.GPUgraph with .option.GPUfp16
 #endif
 
     float *d_modes = NULL; // linear memory of GPU
@@ -885,8 +917,12 @@ static errno_t compute_function()
             }
 
 
-            // create d_in
-            cudaStat = cudaMalloc((void **)&d_in, sizeof(float) * m);
+            // create d_in, zero-padded to a multiple of 8 for the fp16 MVM
+            cudaStat = cudaMalloc((void **)&d_in, sizeof(float) * ((m + 7) / 8 * 8));
+            if(cudaStat == cudaSuccess)
+            {
+                cudaStat = cudaMemset(d_in, 0, sizeof(float) * ((m + 7) / 8 * 8));
+            }
             if(cudaStat != cudaSuccess)
             {
                 printf("cudaMalloc d_in returned error code %d, line %d\n",
@@ -1367,8 +1403,19 @@ static errno_t compute_function()
             struct timespec t0, t1, t2, t3, t4;
             clock_gettime(CLOCK_MILK, &t0);
             int gputiming = (*GPUtiming == 1); // read once so both events are recorded
-            // the reference frame always takes the step-by-step path
-            int gpusplit = (*GPUsplit >= 0) && (*GPUsplit != *GPUindex) && (initref == 1);
+            int gpufp16 = (*GPUfp16 == 1);
+            if(gpufp16 && d_modesh == NULL)
+            {
+                if(MVM_fp16_setup(d_modes, mask_npix, NBmodes, &d_modesh, &d_mscale, &ldah) != 0)
+                {
+                    processinfo_WriteMessage(processinfo, "GPU fp16 setup failed");
+                    data.fpsptr->parray[fpi_GPUfp16].fpflag &= ~FPFLAG_ONOFF;
+                    *GPUfp16 = 0;
+                    gpufp16 = 0;
+                }
+            }
+            // the reference frame always takes the step-by-step path; the split is fp32 only
+            int gpusplit = (*GPUsplit >= 0) && (*GPUsplit != *GPUindex) && (initref == 1) && !gpufp16;
             if(gpusplit && mvmsplit.dev < 0)
             {
                 if(setup_mvm_split(&mvmsplit, *GPUindex, *GPUsplit, mvmstream, cublasH, d_in,
@@ -1381,11 +1428,13 @@ static errno_t compute_function()
                 }
             }
             int gpugraph = ((*GPUgraph == 1) && (initref == 1)) || gpusplit;
-            if(gpugraph && !gpusplit && mvmgraph == NULL)
+            cudaGraphExec_t *graphp = gpufp16 ? &mvmgraph16 : &mvmgraph;
+            if(gpugraph && !gpusplit && *graphp == NULL)
             {
-                mvmgraph = capture_mvm_graph(mvmstream, cublasH, d_in, h_in, mask_npix, d_modes,
-                                             NBmodes, alpha, beta, d_modeval, h_modeval);
-                if(mvmgraph == NULL)
+                *graphp = capture_mvm_graph(mvmstream, cublasH, d_in, h_in, mask_npix, d_modes,
+                                            NBmodes, alpha, beta, d_modeval, h_modeval,
+                                            gpufp16 ? d_modesh : NULL, d_mscale, ldah);
+                if(*graphp == NULL)
                 {
                     processinfo_WriteMessage(processinfo, "GPU graph capture failed");
                     data.fpsptr->parray[fpi_GPUgraph].fpflag &= ~FPFLAG_ONOFF;
@@ -1423,7 +1472,7 @@ static errno_t compute_function()
                 {
                     cudaEventRecord(evgemv0, mvmstream);
                 }
-                cudaStat = cudaGraphLaunch(gpusplit ? mvmsplit.graph0 : mvmgraph, mvmstream);
+                cudaStat = cudaGraphLaunch(gpusplit ? mvmsplit.graph0 : *graphp, mvmstream);
                 if(gputiming)
                 {
                     cudaEventRecord(evgemv1, mvmstream);
@@ -1458,7 +1507,14 @@ static errno_t compute_function()
             {
                 cudaEventRecord(evgemv0, 0);
             }
-            if(!gpugraph)
+            if(!gpugraph && gpufp16)
+            {
+                if(MVM_fp16_gemvT(d_modesh, d_mscale, d_in, d_modeval, ldah, NBmodes, 0) != 0)
+                {
+                    cublas_status = CUBLAS_STATUS_EXECUTION_FAILED;
+                }
+            }
+            else if(!gpugraph)
             {
                 cublas_status = cublasSgemv(cublasH,
                                             CUBLAS_OP_T,
@@ -1568,10 +1624,12 @@ static errno_t compute_function()
                 {
                     // compact to fit procCTRL's 35-char message column, all in us:
                     // total, gather, H2D, wait for gemv + D2H, output, GPU-side kernel time
+                    // (G0h: fp16 matrix)
                     float kernelms = 0;
                     cudaEventElapsedTime(&kernelms, evgemv0, evgemv1);
-                    processinfo_WriteMessage_fmt(processinfo, "G%d %.1f:g%.1f h%.1f w%.1f o%.1f k%.1f",
-                                                 *GPUindex, timespec_diff_double(t0, t4) * 1e6,
+                    processinfo_WriteMessage_fmt(processinfo, "G%d%s %.1f:g%.1f h%.1f w%.1f o%.1f k%.1f",
+                                                 *GPUindex, gpufp16 ? "h" : "",
+                                                 timespec_diff_double(t0, t4) * 1e6,
                                                  timespec_diff_double(t0, t1) * 1e6,
                                                  timespec_diff_double(t1, t2) * 1e6,
                                                  timespec_diff_double(t2, t3) * 1e6,
@@ -1580,8 +1638,9 @@ static errno_t compute_function()
                 }
                 else
                 {
-                    processinfo_WriteMessage_fmt(processinfo, "GPU%d %dx%d MVM %.3f us", *GPUindex,
-                                                 n, m, timespec_diff_double(t0, t4) * 1e6);
+                    processinfo_WriteMessage_fmt(processinfo, "GPU%d%s %dx%d MVM %.3f us", *GPUindex,
+                                                 gpufp16 ? " fp16" : "", n, m,
+                                                 timespec_diff_double(t0, t4) * 1e6);
                 }
 
 
@@ -1613,6 +1672,15 @@ static errno_t compute_function()
     if(mvmgraph != NULL)
     {
         cudaGraphExecDestroy(mvmgraph);
+    }
+    if(mvmgraph16 != NULL)
+    {
+        cudaGraphExecDestroy(mvmgraph16);
+    }
+    if(d_modesh != NULL)
+    {
+        cudaFree(d_modesh);
+        cudaFree(d_mscale);
     }
     if(mvmstream != NULL)
     {

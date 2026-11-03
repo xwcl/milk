@@ -99,6 +99,11 @@ if(USE_CUDA)
   target_link_libraries(${LIBNAME} PRIVATE CUDA::cublas CUDA::cusolver)
   target_compile_options(${LIBNAME} PUBLIC -DHAVE_CUDA)
 
+  # fp16 MVM kernel; shared runtime so it shares CUDA state with the rest of milk
+  target_sources(${LIBNAME} PRIVATE MVM_fp16.cu)
+  set_target_properties(${LIBNAME} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+  install(FILES MVM_fp16.h DESTINATION include/${SRCNAME})
+
   if(USE_MAGMA)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(MAGMA REQUIRED magma)
