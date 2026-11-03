@@ -365,7 +365,8 @@ static cudaGraphExec_t capture_mvm_graph(
     float *h_modeval,
     const void *d_modesh,
     const float *d_mscale,
-    int ldah
+    int ldah,
+    int l2persist
 )
 {
     cudaGraph_t graph;
@@ -376,7 +377,7 @@ static cudaGraphExec_t capture_mvm_graph(
     cudaMemcpyAsync(d_in, h_in, sizeof(float) * npix, cudaMemcpyHostToDevice, stream);
     if(d_modesh != NULL)
     {
-        MVM_fp16_gemvT(d_modesh, d_mscale, d_in, d_modeval, ldah, NBmodes, stream);
+        MVM_fp16_gemvT(d_modesh, d_mscale, d_in, d_modeval, ldah, NBmodes, stream, l2persist);
     }
     else
     {
@@ -439,7 +440,7 @@ static int setup_mvm_split(
     int n1 = NBmodes - sp->n0;
 
     sp->graph0 = capture_mvm_graph(stream0, cublasH0, d_in0, h_in, npix, d_modes, sp->n0,
-                                   alpha, beta, d_modeval0, h_modeval, NULL, NULL, 0);
+                                   alpha, beta, d_modeval0, h_modeval, NULL, NULL, 0, 0);
     if(sp->graph0 == NULL)
     {
         return -1;
@@ -458,7 +459,7 @@ static int setup_mvm_split(
     {
         sp->graph1 = capture_mvm_graph(sp->stream1, sp->cublasH1, sp->d_in1, h_in, npix,
                                        sp->d_modes1, n1, alpha, beta, sp->d_modeval1,
-                                       h_modeval + sp->n0, NULL, NULL, 0);
+                                       h_modeval + sp->n0, NULL, NULL, 0, 0);
         ok = (sp->graph1 != NULL);
     }
     cudaSetDevice(dev0);
@@ -504,6 +505,8 @@ static errno_t compute_function()
     void *d_modesh = NULL;            // fp16 matrix, converted on first use of .option.GPUfp16
     float *d_mscale = NULL;           // per-mode scale of d_modesh
     int ldah = 0;                     // padded column length of d_modesh
+    int l2fp16 = 0;                   // L2 is reserved for d_modesh
+    int fp16prev = 0;                 // previous frame used d_modesh
     cudaGraphExec_t mvmgraph16 = NULL; // .option.GPUgraph with .option.GPUfp16
 #endif
 
@@ -1406,14 +1409,25 @@ static errno_t compute_function()
             int gpufp16 = (*GPUfp16 == 1);
             if(gpufp16 && d_modesh == NULL)
             {
-                if(MVM_fp16_setup(d_modes, mask_npix, NBmodes, &d_modesh, &d_mscale, &ldah) != 0)
+                if(MVM_fp16_setup(d_modes, mask_npix, NBmodes, &d_modesh, &d_mscale, &ldah,
+                                  &l2fp16) != 0)
                 {
                     processinfo_WriteMessage(processinfo, "GPU fp16 setup failed");
                     data.fpsptr->parray[fpi_GPUfp16].fpflag &= ~FPFLAG_ONOFF;
                     *GPUfp16 = 0;
                     gpufp16 = 0;
                 }
+                else
+                {
+                    printf("fp16 matrix ready, L2 %s\n", l2fp16 ? "reserved" : "reservation unavailable");
+                }
             }
+            if(fp16prev && !gpufp16 && l2fp16)
+            {
+                // let the fp32 matrix use the L2 that the fp16 matrix held
+                MVM_fp16_l2release();
+            }
+            fp16prev = gpufp16;
             // the reference frame always takes the step-by-step path; the split is fp32 only
             int gpusplit = (*GPUsplit >= 0) && (*GPUsplit != *GPUindex) && (initref == 1) && !gpufp16;
             if(gpusplit && mvmsplit.dev < 0)
@@ -1433,7 +1447,7 @@ static errno_t compute_function()
             {
                 *graphp = capture_mvm_graph(mvmstream, cublasH, d_in, h_in, mask_npix, d_modes,
                                             NBmodes, alpha, beta, d_modeval, h_modeval,
-                                            gpufp16 ? d_modesh : NULL, d_mscale, ldah);
+                                            gpufp16 ? d_modesh : NULL, d_mscale, ldah, l2fp16);
                 if(*graphp == NULL)
                 {
                     processinfo_WriteMessage(processinfo, "GPU graph capture failed");
@@ -1509,7 +1523,7 @@ static errno_t compute_function()
             }
             if(!gpugraph && gpufp16)
             {
-                if(MVM_fp16_gemvT(d_modesh, d_mscale, d_in, d_modeval, ldah, NBmodes, 0) != 0)
+                if(MVM_fp16_gemvT(d_modesh, d_mscale, d_in, d_modeval, ldah, NBmodes, 0, l2fp16) != 0)
                 {
                     cublas_status = CUBLAS_STATUS_EXECUTION_FAILED;
                 }
