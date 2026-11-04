@@ -109,7 +109,6 @@ extern "C" int MVM_fp16_setup(const float *d_modes, int npix, int nmodes, void *
                               float **d_scale, int *lda, int *l2persist)
 {
     *lda       = (npix + 7) / 8 * 8;
-    *l2persist = 0;
     size_t nbytes = sizeof(__half) * (size_t)(*lda) * nmodes;
     if(cudaMalloc(d_modesh, nbytes) != cudaSuccess)
     {
@@ -133,19 +132,22 @@ extern "C" int MVM_fp16_setup(const float *d_modes, int npix, int nmodes, void *
         return -1;
     }
 
+    *l2persist = MVM_fp16_l2reserve(*lda, nmodes);
+    return 0;
+}
+
+extern "C" int MVM_fp16_l2reserve(int lda, int nmodes)
+{
     // reserve L2 for the matrix if it fits, so other GPU work cannot evict it
-    int dev;
-    int maxpersist = 0;
-    int maxwindow  = 0;
+    size_t nbytes = sizeof(__half) * (size_t) lda * nmodes;
+    int    dev;
+    int    maxpersist = 0;
+    int    maxwindow  = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&maxpersist, cudaDevAttrMaxPersistingL2CacheSize, dev);
     cudaDeviceGetAttribute(&maxwindow, cudaDevAttrMaxAccessPolicyWindowSize, dev);
-    if((size_t) maxpersist >= nbytes && (size_t) maxwindow >= nbytes &&
-            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, nbytes) == cudaSuccess)
-    {
-        *l2persist = 1;
-    }
-    return 0;
+    return ((size_t) maxpersist >= nbytes && (size_t) maxwindow >= nbytes &&
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, nbytes) == cudaSuccess) ? 1 : 0;
 }
 
 extern "C" int MVM_fp16_gemvT(const void *d_modesh, const float *d_scale, const float *d_in,
@@ -175,4 +177,5 @@ extern "C" int MVM_fp16_gemvT(const void *d_modesh, const float *d_scale, const 
 extern "C" void MVM_fp16_l2release(void)
 {
     cudaCtxResetPersistingL2Cache();
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
 }

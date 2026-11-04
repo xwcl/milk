@@ -1421,9 +1421,14 @@ static errno_t compute_function()
                     printf("fp16 matrix ready, L2 %s\n", l2fp16 ? "reserved" : "reservation unavailable");
                 }
             }
+            else if(gpufp16 && !fp16prev && l2fp16)
+            {
+                // reserve the L2 again after switching back from fp32
+                MVM_fp16_l2reserve(ldah, NBmodes);
+            }
             if(fp16prev && !gpufp16 && l2fp16)
             {
-                // let the fp32 matrix use the L2 that the fp16 matrix held
+                // let the fp32 matrix use all of the L2 again
                 MVM_fp16_l2release();
             }
             fp16prev = gpufp16;

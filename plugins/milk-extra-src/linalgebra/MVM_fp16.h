@@ -25,7 +25,11 @@ int MVM_fp16_setup(const float *d_modes, int npix, int nmodes, void **d_modesh,
 int MVM_fp16_gemvT(const void *d_modesh, const float *d_scale, const float *d_in,
                    float *d_out, int lda, int nmodes, cudaStream_t stream, int l2persist);
 
-// Return L2 lines held for the fp16 matrix to normal use (when switching back to fp32)
+// Reserve L2 for an lda x nmodes fp16 matrix. Returns 1 if reserved, 0 if it does not fit.
+// MVM_fp16_setup calls this; call it again after MVM_fp16_l2release to switch back to fp16.
+int MVM_fp16_l2reserve(int lda, int nmodes);
+
+// Return the L2 reserved for the fp16 matrix to normal use (when switching back to fp32)
 void MVM_fp16_l2release(void);
 
 #ifdef __cplusplus
