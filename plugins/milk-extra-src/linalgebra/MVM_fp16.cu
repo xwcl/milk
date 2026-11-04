@@ -54,7 +54,7 @@ __device__ __forceinline__ static float dot8(uint4 av, float4 x0, float4 x1)
 }
 
 static const int MVM_FP16_THREADS = 256; // threads per block
-static const int MVM_FP16_TPM     = 32;  // threads per mode (64 raised loop jitter on an RTX 4090)
+static const int MVM_FP16_TPM     = 64;  // threads per mode: fills a large GPU's SMs
 
 // MVM_FP16_TPM threads per mode, 16-byte loads, two loads in flight per thread
 __global__ static void gemvT_h(const __half *__restrict A, const float *__restrict scale,
