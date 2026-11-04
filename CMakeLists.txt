@@ -26,6 +26,10 @@ option(USE_CUDA  "Use CUDA        library" OFF)
 option(USE_MAGMA "Use MAGMA       library" OFF)
 
 if(USE_CUDA)
+  # build CUDA kernels for the GPUs in this machine unless told otherwise
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
