@@ -228,7 +228,7 @@ static CLICMDARGDEF farg[] =
     {
         CLIARG_UINT64,
         ".option.twait",
-        "insert time wait [us] at each iteration",
+        "delay output publication [us] (GPU mode)",
         "0",
         CLIARG_HIDDEN_DEFAULT,
         (void **) &twait,
@@ -315,6 +315,7 @@ static errno_t customCONFsetup()
         data.fpsptr->parray[fpi_GPUgraph].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUsplit].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUfp16].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_twait].fpflag |= FPFLAG_WRITERUN;
     }
 
     return RETURN_SUCCESS;
@@ -1126,8 +1127,6 @@ static errno_t compute_function()
 
     initref = 0; // 1 when reference has been processed
 
-    // long twait1 = *twait;
-
     printf("LOOP START   MODEVALCOMPUTE = %d\n", MODEVALCOMPUTE);
     fflush(stdout);
 
@@ -1657,7 +1656,15 @@ static errno_t compute_function()
                                                  timespec_diff_double(t0, t4) * 1e6);
                 }
 
-
+                if(*twait > 0)
+                {
+                    // delay publication by twait us (latency and phase tests)
+                    struct timespec tw;
+                    do
+                    {
+                        clock_gettime(CLOCK_MILK, &tw);
+                    } while(timespec_diff_double(t4, tw) * 1e6 < *twait);
+                }
 
                 processinfo_update_output_stream(processinfo, imgout.ID);
             }
