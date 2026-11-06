@@ -1,6 +1,6 @@
 /**
  * @file    MVM_fp16.cu
- * @brief   GPU MVM with a half-precision matrix and single-precision input and sums, and a kernel input copy
+ * @brief   GPU MVM with a half-precision matrix and single-precision input and sums, and kernel copies to and from pinned host memory
  *
  * Halving the matrix size halves the memory traffic of a matrix-vector multiply.
  * Each mode is scaled by its largest |element| before conversion, so the result
@@ -174,18 +174,25 @@ extern "C" int MVM_fp16_gemvT(const void *d_modesh, const float *d_scale, const 
                                lda, nmodes) == cudaSuccess) ? 0 : -1;
 }
 
-__global__ static void copyin(const float *__restrict h, float *__restrict d, int n)
+// dst[i] = src[i]; either side may be pinned host memory
+__global__ static void copyf(const float *__restrict src, float *__restrict dst, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if(i < n)
     {
-        d[i] = h[i];
+        dst[i] = src[i];
     }
 }
 
 extern "C" int MVM_copyin(const float *h_in, float *d_in, int n, cudaStream_t stream)
 {
-    copyin<<<(n + 255) / 256, 256, 0, stream>>>(h_in, d_in, n);
+    copyf<<<(n + 255) / 256, 256, 0, stream>>>(h_in, d_in, n);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int MVM_copyout(const float *d_out, float *h_out, int n, cudaStream_t stream)
+{
+    copyf<<<(n + 255) / 256, 256, 0, stream>>>(d_out, h_out, n);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
