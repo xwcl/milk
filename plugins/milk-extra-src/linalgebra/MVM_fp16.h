@@ -1,6 +1,6 @@
 /**
  * @file    MVM_fp16.h
- * @brief   GPU MVM with a half-precision matrix and single-precision input and sums, and a kernel input copy
+ * @brief   GPU MVM with a half-precision matrix and single-precision input and sums, and kernel copies to and from pinned host memory
  */
 
 #ifndef LINALGEBRA_MVM_FP16_H
@@ -32,6 +32,11 @@ int MVM_fp16_l2reserve(int lda, int nmodes);
 // Copy n floats from pinned host memory (cudaMallocHost, addressable by the GPU) to the
 // device with a kernel, so a CUDA graph needs no copy-engine node. Returns 0 on success.
 int MVM_copyin(const float *h_in, float *d_in, int n, cudaStream_t stream);
+
+// Copy n floats from the device to pinned host memory with a kernel, as contiguous lines.
+// An MVM writing its result straight to host memory makes one small PCIe write per mode,
+// which costs ~10 us more for 1563 modes. Returns 0 on success.
+int MVM_copyout(const float *d_out, float *h_out, int n, cudaStream_t stream);
 
 // Return the L2 reserved for the fp16 matrix to normal use (when switching back to fp32)
 void MVM_fp16_l2release(void);
