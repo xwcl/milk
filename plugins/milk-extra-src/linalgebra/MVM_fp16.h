@@ -26,7 +26,7 @@ int MVM_fp16_gemvT(const void *d_modesh, const float *d_scale, const float *d_in
                    float *d_out, int lda, int nmodes, cudaStream_t stream, int l2persist);
 
 // Reserve L2 for an lda x nmodes fp16 matrix. Returns 1 if reserved, 0 if it does not fit.
-// MVM_fp16_setup calls this; call it again after MVM_fp16_l2release to switch back to fp16.
+// MVM_fp16_setup calls this.
 int MVM_fp16_l2reserve(int lda, int nmodes);
 
 // Copy n floats from pinned host memory (cudaMallocHost, addressable by the GPU) to the

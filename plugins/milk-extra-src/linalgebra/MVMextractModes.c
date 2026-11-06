@@ -509,7 +509,6 @@ static errno_t compute_function()
     float *d_mscale = NULL;           // per-mode scale of d_modesh
     int ldah = 0;                     // padded column length of d_modesh
     int l2fp16 = 0;                   // L2 is reserved for d_modesh
-    int fp16prev = 0;                 // previous frame used d_modesh
     cudaGraphExec_t mvmgraph16 = NULL; // .option.GPUgraph with .option.GPUfp16
 #endif
 
@@ -1408,6 +1407,26 @@ static errno_t compute_function()
             clock_gettime(CLOCK_MILK, &t0);
             int gputiming = (*GPUtiming == 1); // read once so both events are recorded
             int gpufp16 = (*GPUfp16 == 1);
+            if(!gpufp16 && d_modesh != NULL)
+            {
+                // switching to fp32: drop all fp16 state so fp32 runs as from a fresh start.
+                // Releasing only the L2 reservation left fp32 at ~100 us instead of ~50 until
+                // a restart. Switching fp16 back on sets it up again from scratch.
+                if(l2fp16)
+                {
+                    MVM_fp16_l2release();
+                }
+                if(mvmgraph16 != NULL)
+                {
+                    cudaGraphExecDestroy(mvmgraph16);
+                    mvmgraph16 = NULL;
+                }
+                cudaFree(d_modesh);
+                cudaFree(d_mscale);
+                d_modesh = NULL;
+                d_mscale = NULL;
+                l2fp16   = 0;
+            }
             if(gpufp16 && d_modesh == NULL)
             {
                 if(MVM_fp16_setup(d_modes, mask_npix, NBmodes, &d_modesh, &d_mscale, &ldah,
@@ -1423,17 +1442,6 @@ static errno_t compute_function()
                     printf("fp16 matrix ready, L2 %s\n", l2fp16 ? "reserved" : "reservation unavailable");
                 }
             }
-            else if(gpufp16 && !fp16prev && l2fp16)
-            {
-                // reserve the L2 again after switching back from fp32
-                MVM_fp16_l2reserve(ldah, NBmodes);
-            }
-            if(fp16prev && !gpufp16 && l2fp16)
-            {
-                // let the fp32 matrix use all of the L2 again
-                MVM_fp16_l2release();
-            }
-            fp16prev = gpufp16;
             // the reference frame always takes the step-by-step path; the split is fp32 only
             int gpusplit = (*GPUsplit >= 0) && (*GPUsplit != *GPUindex) && (initref == 1) && !gpufp16;
             if(gpusplit && mvmsplit.dev < 0)
