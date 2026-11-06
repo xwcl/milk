@@ -510,6 +510,7 @@ static errno_t compute_function()
     int ldah = 0;                     // padded column length of d_modesh
     int l2fp16 = 0;                   // L2 is reserved for d_modesh
     cudaGraphExec_t mvmgraph16 = NULL; // .option.GPUgraph with .option.GPUfp16
+    struct timespec tmsg = {0, 0};    // last GPU MVM time message
 #endif
 
     float *d_modes = NULL; // linear memory of GPU
@@ -1664,8 +1665,10 @@ static errno_t compute_function()
                                                  timespec_diff_double(t3, t4) * 1e6,
                                                  kernelms * 1e3);
                 }
-                else
+                else if(timespec_diff_double(tmsg, t4) >= 1.0)
                 {
+                    // formatting the message costs ~2 us, so show one frame's time per second
+                    tmsg = t4;
                     processinfo_WriteMessage_fmt(processinfo, "GPU%d%s %dx%d MVM %.3f us", *GPUindex,
                                                  gpufp16 ? " fp16" : "", n, m,
                                                  timespec_diff_double(t0, t4) * 1e6);
