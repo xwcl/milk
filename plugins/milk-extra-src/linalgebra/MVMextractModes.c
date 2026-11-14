@@ -9,6 +9,10 @@
 
 #include <pthread.h>
 
+#ifdef __AVX__
+#include <immintrin.h>
+#endif
+
 
 // Use MKL if available
 // Otherwise use openBLAS
@@ -103,6 +107,12 @@ long fpi_GPUsplit;
 
 static int64_t *GPUfp16;
 long fpi_GPUfp16;
+
+static int64_t *outpub;
+long fpi_outpub;
+
+static int64_t *outpubNT;
+long fpi_outpubNT;
 
 
 
@@ -296,6 +306,24 @@ static CLICMDARGDEF farg[] =
         CLIARG_HIDDEN_DEFAULT,
         (void **) &GPUfp16,
         &fpi_GPUfp16
+    },
+    {
+        CLIARG_ONOFF,
+        ".option.outpub",
+        "copy the output to <outcoeff>pub after publishing, for readers outside the loop",
+        "0",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &outpub,
+        &fpi_outpub
+    },
+    {
+        CLIARG_ONOFF,
+        ".option.outpubNT",
+        "non-temporal <outcoeff>pub stores",
+        "0",
+        CLIARG_HIDDEN_DEFAULT,
+        (void **) &outpubNT,
+        &fpi_outpubNT
     }
 };
 
@@ -315,6 +343,8 @@ static errno_t customCONFsetup()
         data.fpsptr->parray[fpi_GPUgraph].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUsplit].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_GPUfp16].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_outpub].fpflag |= FPFLAG_WRITERUN;
+        data.fpsptr->parray[fpi_outpubNT].fpflag |= FPFLAG_WRITERUN;
         data.fpsptr->parray[fpi_twait].fpflag |= FPFLAG_WRITERUN;
     }
 
@@ -343,6 +373,42 @@ static CLICMDDATA CLIcmddata =
 static errno_t help_function()
 {
     return RETURN_SUCCESS;
+}
+
+
+
+// Copy the published output to imgpub and publish it with the output's atime
+// (.option.outpub). Readers outside the loop use imgpub, so only this core and
+// the loop's own readers touch the output stream's lines. With .option.outpubNT
+// the copy uses non-temporal stores, so this core does not take back lines
+// cached by imgpub's readers.
+static void publish_copy(IMGID imgpub, IMGID imgout)
+{
+    float *__restrict out      = imgpub.im->array.F;
+    const float *__restrict in = imgout.im->array.F;
+    uint64_t n                 = imgout.md->nelement;
+    uint64_t ii                = 0;
+
+    imgpub.md->write = 1;
+
+#ifdef __AVX__
+    if(*outpubNT == 1)
+    {
+        for(; ii < n && ((uintptr_t)(out + ii) & 31); ii++)
+        {
+            out[ii] = in[ii];
+        }
+        for(; ii + 8 <= n; ii += 8)
+        {
+            _mm256_stream_ps(out + ii, _mm256_loadu_ps(in + ii));
+        }
+        _mm_sfence();
+    }
+#endif
+
+    memcpy(out + ii, in + ii, sizeof(float) * (n - ii));
+
+    ImageStreamIO_UpdateIm_atime(imgpub.im, &imgout.md->atime);
 }
 
 
@@ -772,6 +838,11 @@ static errno_t compute_function()
 
     // CONNNECT TO OR CREATE OUTPUT STREAM
     IMGID imgout = stream_connect_create_2Df32(outcoeff, arraytmp[0], arraytmp[1]);
+
+    // Copy of the output for readers outside the loop (.option.outpub)
+    char pubname[STRINGMAXLEN_STREAMNAME];
+    WRITE_IMAGENAME(pubname, "%spub", outcoeff);
+    IMGID imgpub = stream_connect_create_2Df32(pubname, arraytmp[0], arraytmp[1]);
 
     // Local working copy of output
     float *outarray = (float *) malloc(sizeof(float) * arraytmp[0] * arraytmp[1]);
@@ -1397,6 +1468,11 @@ static errno_t compute_function()
             }
 //            memcpy(imgout.im->array.F, outarray, sizeof(float)*n);
             processinfo_update_output_stream(processinfo, imgout.ID);
+
+            if(*outpub == 1)
+            {
+                publish_copy(imgpub, imgout);
+            }
         }
         else
         {
@@ -1685,6 +1761,11 @@ static errno_t compute_function()
                 }
 
                 processinfo_update_output_stream(processinfo, imgout.ID);
+
+                if(*outpub == 1)
+                {
+                    publish_copy(imgpub, imgout);
+                }
             }
 #endif
         }
